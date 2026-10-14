@@ -1,0 +1,6 @@
+{
+  "name": "TourismFlow AI",
+  "description": "Smart Tourism & Local Economy Platform connecting tourists, local businesses, and tourism authorities with AI-powered trip planning and the Tourism Impact Engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
