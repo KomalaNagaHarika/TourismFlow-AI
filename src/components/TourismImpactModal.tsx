@@ -38,11 +38,19 @@ export const TourismImpactModal: React.FC<TourismImpactModalProps> = ({ attracti
         preferences
       })
     })
-      .then(res => res.json())
+      .then(async res => {
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          return res.json();
+        }
+        return null;
+      })
       .then(data => {
-        if (isMounted) {
+        if (isMounted && data && data.breakdown) {
           setExplanationData(data.breakdown);
           setLoading(false);
+        } else if (isMounted) {
+          throw new Error('Fallback needed');
         }
       })
       .catch(err => {

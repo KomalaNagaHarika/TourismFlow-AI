@@ -30,6 +30,7 @@ import {
 import { useTourismFlow } from '../context/TourismFlowContext';
 import { Category, PlanRepairType, RepairResult, DayPlan, ItineraryItem } from '../types/tourism';
 import { HYDERABAD_ATTRACTIONS } from '../data/hyderabadData';
+import { getCuratedDestinationItinerary } from '../data/destinationData';
 import { TourismImpactModal } from './TourismImpactModal';
 
 const INTEREST_OPTIONS: { id: Category; label: string; icon: string }[] = [
@@ -61,6 +62,8 @@ export const TripPlanner: React.FC = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationStep, setGenerationStep] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
+  const [sourceNotice, setSourceNotice] = useState('');
+  const [itinerarySource, setItinerarySource] = useState('');
   const [activeDayTab, setActiveDayTab] = useState<number>(1);
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [copiedShareLink, setCopiedShareLink] = useState(false);
@@ -102,6 +105,7 @@ export const TripPlanner: React.FC = () => {
   const handleGenerateItinerary = async () => {
     setIsGenerating(true);
     setErrorMsg('');
+    setSourceNotice('');
     setRepairResult(null);
     setIsEditing(false);
     setDraftItinerary(null);
@@ -109,12 +113,13 @@ export const TripPlanner: React.FC = () => {
     setItinerary(null);
     setItineraryDestination(null);
 
-    setGenerationStep(`Analyzing travel party, budget & pace for ${preferences.destination}...`);
+    const destClean = preferences.destination.trim();
+    setGenerationStep(`Analyzing travel party, budget & pace for ${destClean}...`);
     const stepTimer1 = setTimeout(() => {
-      setGenerationStep(`Clustering authentic attractions geographically in ${preferences.destination}...`);
+      setGenerationStep(`Clustering authentic attractions geographically in ${destClean}...`);
     }, 600);
     const stepTimer2 = setTimeout(() => {
-      setGenerationStep(`Injecting local artisan workshops & culinary gems native to ${preferences.destination}...`);
+      setGenerationStep(`Injecting local artisan workshops & culinary gems native to ${destClean}...`);
     }, 1200);
 
     try {
@@ -124,28 +129,75 @@ export const TripPlanner: React.FC = () => {
         body: JSON.stringify(preferences),
       });
 
-      const data = await response.json();
+      const contentType = response.headers.get('content-type') || '';
+      let data: any = null;
 
-      if (!response.ok || data.error) {
-        setItinerary(null);
-        setItineraryDestination(null);
-        throw new Error(data.error || `Generation failed with status ${response.status}`);
-      }
-
-      if (data.days && Array.isArray(data.days) && data.days.length > 0) {
-        setItinerary(data.days);
-        setItineraryDestination(preferences.destination);
-        setOriginalGeneratedItinerary(data.days);
-        setActiveDayTab(1);
-        logEvent('itinerary_gen', 'SmartPlanner', `plan_${Date.now()}`, `${preferences.days}-Day Itinerary for ${preferences.destination}`);
+      if (contentType.includes('application/json')) {
+        try {
+          data = await response.json();
+        } catch (jsonErr) {
+          console.warn('JSON parse error from server:', jsonErr);
+          data = null;
+        }
       } else {
-        setItinerary(null);
-        setItineraryDestination(null);
-        throw new Error(`Could not generate recommendations for "${preferences.destination}".`);
+        // Non-JSON response (e.g., HTML 404/500 error page from server or Vercel edge)
+        const rawText = await response.text();
+        console.warn(`Received non-JSON response (HTTP ${response.status}):`, rawText.slice(0, 150));
       }
+
+      // Check if server returned a successful valid plan
+      if (response.ok && data && Array.isArray(data.days) && data.days.length > 0) {
+        setItinerary(data.days);
+        setItineraryDestination(destClean);
+        setOriginalGeneratedItinerary(data.days);
+        setItinerarySource(data.source || `TourismFlow AI (${destClean})`);
+        if (data.notice) {
+          setSourceNotice(data.notice);
+        }
+        setActiveDayTab(1);
+        logEvent('itinerary_gen', 'SmartPlanner', `plan_${Date.now()}`, `${preferences.days}-Day Itinerary for ${destClean}`);
+        return;
+      }
+
+      // If we reach here, server request either returned an error or was not JSON
+      let serverErrorMsg = data?.error;
+      if (!serverErrorMsg) {
+        if (response.status === 404) {
+          serverErrorMsg = `The itinerary API endpoint was not reachable (HTTP 404). If running on Vercel, verify that serverless functions are deployed.`;
+        } else if (response.status === 500) {
+          serverErrorMsg = `The server encountered an internal issue (HTTP 500) while generating your itinerary.`;
+        } else if (response.status === 503) {
+          serverErrorMsg = `The AI model is currently experiencing high demand (HTTP 503). Please retry in a few moments.`;
+        } else {
+          serverErrorMsg = `Itinerary service returned status ${response.status}.`;
+        }
+      }
+
+      // Safe Graceful Fallback for verified destinations:
+      // Check if this EXACT destination is in our curated sample catalog
+      const exactCurated = getCuratedDestinationItinerary(preferences);
+      if (exactCurated) {
+        setItinerary(exactCurated.days);
+        setItineraryDestination(destClean);
+        setOriginalGeneratedItinerary(exactCurated.days);
+        setItinerarySource(exactCurated.source);
+        setSourceNotice(`Loaded verified curated local itinerary for ${destClean}. (${serverErrorMsg})`);
+        setActiveDayTab(1);
+        logEvent('itinerary_gen', 'SmartPlanner', `plan_${Date.now()}`, `Curated fallback for ${destClean}`);
+        return;
+      }
+
+      // Destination is NOT in curated catalog and live AI failed:
+      // Never silently substitute with an unrelated destination!
+      setItinerary(null);
+      setItineraryDestination(null);
+      throw new Error(
+        serverErrorMsg ||
+        `Could not generate recommendations for "${destClean}". This destination is not currently in our local sample dataset, and the AI service is temporarily unavailable. Please retry in a moment or explore supported sample destinations: Hyderabad, Visakhapatnam, Jaipur, Bengaluru, Goa, Delhi, Mumbai, or Kochi.`
+      );
     } catch (err: any) {
       console.error('Trip plan generation error:', err);
-      setErrorMsg(err.message || `Unable to generate recommendations for "${preferences.destination}". Please try again or test sample cities like Hyderabad, Visakhapatnam, Jaipur, Bengaluru, or Goa.`);
+      setErrorMsg(err.message || `Unable to generate recommendations for "${preferences.destination}".`);
     } finally {
       clearTimeout(stepTimer1);
       clearTimeout(stepTimer2);
@@ -173,17 +225,26 @@ export const TripPlanner: React.FC = () => {
         }),
       });
 
-      if (!response.ok) {
-        throw new Error(`Repair failed with status ${response.status}`);
+      const contentType = response.headers.get('content-type') || '';
+      let result: RepairResult | null = null;
+      if (contentType.includes('application/json')) {
+        try {
+          result = await response.json();
+        } catch (jsonErr) {
+          console.warn('Repair JSON parse error:', jsonErr);
+        }
       }
 
-      const result: RepairResult = await response.json();
+      if (!response.ok || !result || !result.revisedPlan) {
+        throw new Error(`Plan repair service returned status ${response.status}`);
+      }
+
       setRepairResult(result);
       setItinerary(result.revisedPlan);
       logEvent('plan_repair', 'AdaptiveAI', `repair_${chosenType}`, result.changeSummary);
     } catch (err: any) {
       console.error('Plan repair error:', err);
-      setErrorMsg('Could not run plan repair. Applied safe schedule optimization.');
+      setErrorMsg('Could not run plan repair. Please retry in a moment.');
     } finally {
       setRepairing(false);
     }
@@ -813,6 +874,12 @@ export const TripPlanner: React.FC = () => {
               <p className="text-xs text-stone-500 mt-0.5">
                 Total Estimated Cost: <strong className="text-emerald-900 font-mono">₹{totalCalculatedCost.toLocaleString('en-IN')}</strong> of ₹{preferences.budgetInr.toLocaleString('en-IN')} budget
               </p>
+              {sourceNotice && (
+                <div className="mt-2.5 text-xs px-3 py-1.5 rounded-xl bg-amber-50/90 text-amber-900 border border-amber-200/80 flex items-center gap-1.5 font-medium">
+                  <Info className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                  <span>{sourceNotice}</span>
+                </div>
+              )}
             </div>
 
             {/* Quick Actions Bar with EDIT ITINERARY button */}

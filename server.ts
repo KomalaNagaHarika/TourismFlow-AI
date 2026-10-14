@@ -9,6 +9,11 @@ import {
   getCuratedDestinationItinerary 
 } from './src/data/destinationData.ts';
 import { DayPlan, TripPreferences, PlanRepairType, RepairResult } from './src/types/tourism.ts';
+import { 
+  generateItineraryPlan, 
+  repairItineraryPlan, 
+  getBusinessAdvice
+} from './src/services/geminiService.ts';
 
 dotenv.config();
 
@@ -425,126 +430,20 @@ app.post('/api/generate-itinerary', async (req, res) => {
   const prefs: TripPreferences = req.body;
 
   if (!prefs || !prefs.destination) {
-    res.status(400).json({ error: 'Trip preferences are required' });
+    res.status(400).json({ error: 'Trip preferences with a valid destination are required.' });
     return;
   }
 
-  // Attempt Gemini AI Generation if key exists
-  if (ai) {
-    try {
-      const prompt = `
-You are the master itinerary architect of TourismFlow AI.
-Build a structured, realistic, day-by-day travel itinerary strictly for:
-Destination: ${prefs.destination}
-Duration: ${prefs.days} days
-Group Type: ${prefs.groupType} (${prefs.travelersCount} travelers)
-Budget: ₹${prefs.budgetInr} INR total
-Interests: ${prefs.interests.join(', ')}
-Transport: ${prefs.transportPref}
-Pace: ${prefs.walkingPace}
-Crowd Preference: ${prefs.crowdPref}
-
-CRITICAL RULES:
-1. Every activity, attraction, experience, and restaurant MUST be located in and authentic to ${prefs.destination}. Do NOT mention Hyderabad, Charminar, or any other city unless the destination entered is explicitly Hyderabad.
-2. Logically group attractions geographically in the same district or neighborhood per day to eliminate unnecessary zigzag transit.
-3. In accordance with the Tourism Impact Engine, incorporate at least one local artisan workshop, traditional craft market, or authentic regional dining spot native to ${prefs.destination} each day.
-4. Provide realistic timings, durations, cost per person (INR), transport suggestion, travel time in minutes, nearby food options, and working Google Maps search queries: 'https://maps.google.com/?q=' + encodeURIComponent(activity + ', ' + '${prefs.destination}').
-5. Provide a day cost breakdown: transport, entryFees, food, artisanBuffer, total.
-
-Return ONLY a JSON array adhering to this schema:
-[
-  {
-    "day": 1,
-    "theme": "string",
-    "districtFocus": "string",
-    "travelTips": "string",
-    "dayCost": {
-      "transport": number,
-      "entryFees": number,
-      "food": number,
-      "artisanBuffer": number,
-      "total": number
-    },
-    "activities": [
-      {
-        "id": "string",
-        "time": "09:00 AM – 10:30 AM",
-        "activity": "string",
-        "duration": "1.5 hrs",
-        "cost": number,
-        "reason": "string",
-        "transport": "string",
-        "travelTimeMinutes": number,
-        "nearbyFoodOrRest": "string",
-        "mapsLink": "https://maps.google.com/?q=...",
-        "category": "Heritage | Food | Culture | Crafts | Nature | Shopping",
-        "isLocalGem": boolean,
-        "impactScore": number,
-        "impactReason": "string"
-      }
-    ]
-  }
-]
-`;
-
-      const response = await withTimeout(
-        ai.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            temperature: 0.3,
-          },
-        }),
-        25000
-      );
-
-      const responseText = response.text || '';
-      const cleanJson = responseText.trim().replace(/^```json/, '').replace(/```$/, '').trim();
-      const parsed = JSON.parse(cleanJson);
-
-      if (Array.isArray(parsed) && parsed.length > 0) {
-        res.json({
-          days: parsed,
-          isDemoFallback: false,
-          source: `Gemini 3.8 Flash (${prefs.destination})`,
-        });
-        return;
-      }
-    } catch (aiErr: any) {
-      console.warn('Gemini itinerary generation failed or quota reached, using curated fallback:', aiErr?.message || aiErr);
-    }
-  }
-
-  // Destination-specific fallback determination
-  // 1. Hyderabad (Telangana)
-  const isHyd = isDestinationHyderabad(prefs.destination);
-  if (isHyd) {
-    const fallbackDays = generateDeterministicItinerary(prefs);
-    res.json({
-      days: fallbackDays,
-      isDemoFallback: true,
-      source: 'Curated Hyderabad Impact Engine',
+  try {
+    const result = await generateItineraryPlan(prefs);
+    res.json(result);
+  } catch (err: any) {
+    const statusCode = err?.status || 500;
+    res.status(statusCode).json({
+      error: err?.message || `Unable to generate recommendations for "${prefs.destination}".`,
+      isUnsupportedDestination: Boolean(err?.isUnsupportedDestination),
     });
-    return;
   }
-
-  // 2. Other Curated Destinations (Visakhapatnam, Jaipur, Bengaluru, Goa, Delhi, Mumbai, Kochi)
-  const curated = getCuratedDestinationItinerary(prefs);
-  if (curated) {
-    res.json({
-      days: curated.days,
-      isDemoFallback: true,
-      source: curated.source,
-    });
-    return;
-  }
-
-  // 3. If destination is not in curated sample dataset and AI generation is unavailable
-  res.status(422).json({
-    error: `Could not generate recommendations for "${prefs.destination}". This destination is not currently in our local sample dataset, and the AI service is temporarily unavailable. Please retry in a moment or explore supported sample destinations: Hyderabad, Visakhapatnam, Jaipur, Bengaluru, Goa, Delhi, Mumbai, or Kochi.`,
-    isUnsupportedDestination: true,
-  });
 });
 
 // Endpoint: Adaptive Itinerary / Plan Repair AI
@@ -556,143 +455,17 @@ app.post('/api/repair-itinerary', async (req, res) => {
     return;
   }
 
-  const repair: PlanRepairType = repairType || 'late_start';
-
-  // If Gemini is available, attempt intelligent adaptation
-  if (ai) {
-    try {
-      const prompt = `
-You are the adaptive Plan Repair AI of TourismFlow AI.
-The tourist encountered this real-world problem: "${repair}".
-Details provided: "${problemDetails || ''}".
-Preferences: Budget ₹${preferences?.budgetInr || 5000}, Pace: ${preferences?.walkingPace || 'Moderate'}.
-
-Current Itinerary:
-${JSON.stringify(currentPlan, null, 2)}
-
-TASK:
-Propose a revised itinerary that solves the problem while preserving the traveler's core priorities and local artisan support.
-- If 'late_start': Shift morning schedule later, merge/shorten transit, preserve the signature local gem and lunch spot.
-- If 'budget_decreased': Replace high-entry-cost commercial attractions with authentic low-cost or free local gems (e.g. Badshahi Ashurkhana, Paigah Tombs, public artisan streets), recalculate savings.
-- If 'attraction_closed': Replace the closed stop with a nearby alternative gem in the same district.
-- If 'fewer_crowds': Swap peak congested sites for tranquil alternatives (e.g. Qutb Shahi gardens instead of Golkonda peak, Paigah tombs instead of museum).
-- If 'more_rest': Lengthen rest periods, insert a relaxing tea tasting at Nimrah or garden stroll, remove rushed walking.
-- If 'skip_stop': Remove the least critical stop and allocate extra time buffer.
-
-Return ONLY a JSON object:
-{
-  "revisedPlan": [...updated DayPlan array...],
-  "changeSummary": "string explaining what was changed and why in 2-3 sentences",
-  "costDifference": number (e.g. -450 if budget reduced, or 0),
-  "scheduleDifference": "string (e.g. '+2.0 hours morning cushion, zero missed cultural meals')",
-  "changes": [
-    {
-      "activityName": "string",
-      "actionTaken": "rescheduled | swapped | shortened | removed | added_rest",
-      "details": "string"
-    }
-  ]
-}
-`;
-
-      const response = await withTimeout(
-        ai.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            temperature: 0.3,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          },
-        })
-      );
-
-      const cleanJson = (response.text || '').trim().replace(/^```json/, '').replace(/```$/, '').trim();
-      const result: RepairResult = JSON.parse(cleanJson);
-      result.isDemoFallback = false;
-      res.json(result);
-      return;
-    } catch {
-      // Gracefully serve adaptive heuristic plan repair
-    }
+  try {
+    const result = await repairItineraryPlan(
+      currentPlan,
+      repairType || 'late_start',
+      preferences,
+      problemDetails
+    );
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Plan repair failed' });
   }
-
-  // Deterministic Plan Repair Fallback
-  const revised: DayPlan[] = JSON.parse(JSON.stringify(currentPlan));
-  let summary = '';
-  let costDiff = 0;
-  let scheduleDiff = '';
-  const changes: any[] = [];
-
-  if (repair === 'late_start') {
-    summary = 'Shifted Day 1 start by +1.5 hours to 10:30 AM. Combined morning tea into the Laad Bazaar artisan arrival so you do not miss either experience.';
-    scheduleDiff = 'Schedule shifted +90 mins; lunch preserved at 02:00 PM with unhurried pace.';
-    if (revised[0]?.activities?.length >= 2) {
-      revised[0].activities[0].time = '10:30 AM – 11:30 AM';
-      revised[0].activities[0].activity = 'Charminar Minaret Balcony (Expedited Priority)';
-      changes.push({
-        activityName: 'Charminar',
-        actionTaken: 'shortened',
-        details: 'Shortened visit to 60 mins to absorb the 90-min late start delay.'
-      });
-      revised[0].activities[1].time = '11:45 AM – 12:45 PM';
-      changes.push({
-        activityName: 'Nimrah Café & Bakery',
-        actionTaken: 'rescheduled',
-        details: 'Moved to late morning brunch tea pairing without skipping Osmania biscuits.'
-      });
-    }
-  } else if (repair === 'budget_decreased') {
-    costDiff = -350;
-    summary = 'Optimized spending: Replaced paid gallery tickets with the 400-year-old Badshahi Ashurkhana Persian mosaic hall (free entry) and included free garden access.';
-    scheduleDiff = 'Saved ₹350 per person while maintaining high cultural value.';
-    if (revised[0]?.activities?.length > 3) {
-      revised[0].activities[2].activity = 'Badshahi Ashurkhana Enamelled Mosaic Hall (Free Heritage)';
-      revised[0].activities[2].cost = 0;
-      revised[0].activities[2].isLocalGem = true;
-      changes.push({
-        activityName: 'Badshahi Ashurkhana',
-        actionTaken: 'swapped',
-        details: 'Replaced high-fee stop with authentic 430-year-old lapis lazuli mosaic hall.'
-      });
-      revised[0].dayCost.entryFees = Math.max(0, revised[0].dayCost.entryFees - 200);
-      revised[0].dayCost.total = Math.max(0, revised[0].dayCost.total - 350);
-    }
-  } else if (repair === 'fewer_crowds') {
-    summary = 'Transferred peak midday slot to the tranquil Paigah Tombs stucco sanctuary and shaded Qutb Shahi gardens, reducing crowd exposure by 65%.';
-    scheduleDiff = 'Crowd score reduced from High to Low; serene photography atmosphere.';
-    changes.push({
-      activityName: 'Paigah Tombs Sanctuary',
-      actionTaken: 'swapped',
-      details: 'Substituted crowded indoor corridors with tranquil open-air stucco arches.'
-    });
-  } else if (repair === 'more_rest') {
-    summary = 'Extended leisure breaks: Inserted a 45-minute veranda tea tasting break at Nimrah and replaced steep fortress climbing with relaxed lake promenade seating.';
-    scheduleDiff = '+60 minutes buffer added; eliminated steep stair traverses.';
-    changes.push({
-      activityName: 'Veranda Tea Tasting Break',
-      actionTaken: 'added_rest',
-      details: 'Inserted shaded seating with traditional herbal tea for elder/family comfort.'
-    });
-  } else {
-    // Default skip stop
-    summary = 'Streamlined itinerary: Removed an intermediate transit stop to allow deeper 2-hour engagement at the master artisan workshop.';
-    scheduleDiff = 'Eliminated 40 mins of traffic transfers.';
-    changes.push({
-      activityName: 'Secondary Bazaar Stop',
-      actionTaken: 'removed',
-      details: 'Removed to eliminate traffic stress and deepen artisan immersion.'
-    });
-  }
-
-  res.json({
-    revisedPlan: revised,
-    changeSummary: summary,
-    costDifference: costDiff,
-    scheduleDifference: scheduleDiff,
-    changes,
-    isDemoFallback: true,
-  });
 });
 
 // Endpoint: AI Business Advisor for Local Artisans
@@ -704,85 +477,16 @@ app.post('/api/business-advice', async (req, res) => {
     return;
   }
 
-  if (ai) {
-    try {
-      const prompt = `
-You are the AI Business Advisor on TourismFlow AI.
-Analyze this local artisan/business:
-Name: ${business.name} (${business.category})
-Story: ${business.story}
-Products: ${JSON.stringify(business.products)}
-Observed Demo Metrics: Views: ${demoMetrics?.views || 300}, Saves: ${demoMetrics?.saves || 80}, Trip Additions: ${demoMetrics?.tripAdditions || 35}.
-Top Traveler Demand Trends: ${popularInterests?.join(', ') || 'Heritage, Authentic Craft Workshops, Cultural Dining'}.
-
-Provide 4 practical, high-impact business advisory suggestions:
-1. Experience Highlight: Which specific workshop or product to promote to tourists.
-2. Listing Optimization: How to improve the description to resonate with families and cultural travelers.
-3. Traveler Interest Alignment: How to package offerings to match top traveler search trends.
-4. Value Bundle / Micro-Offer: A suggested quick package or pricing structure to increase foot traffic.
-
-Return ONLY a JSON array of 4 suggestion cards:
-[
-  {
-    "category": "Experience Highlight | Listing Optimization | Interest Alignment | Package Offer",
-    "title": "Short punchy title",
-    "advice": "Clear, actionable recommendation (2-3 sentences)",
-    "expectedImpact": "e.g. +25% morning foot traffic from family travelers"
+  try {
+    const result = await getBusinessAdvice(
+      business,
+      demoMetrics,
+      popularInterests || ['Heritage', 'Authentic Local Crafts', 'Culinary Traditions']
+    );
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Business advice failed' });
   }
-]
-`;
-
-      const response = await withTimeout(
-        ai.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: prompt,
-          config: {
-            responseMimeType: 'application/json',
-            temperature: 0.3,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          },
-        })
-      );
-
-      const cleanJson = (response.text || '').trim().replace(/^```json/, '').replace(/```$/, '').trim();
-      const suggestions = JSON.parse(cleanJson);
-      res.json({ suggestions, isDemoFallback: false });
-      return;
-    } catch {
-      // Gracefully serve verified business advisory insights
-    }
-  }
-
-  // Deterministic advisory fallback
-  res.json({
-    suggestions: [
-      {
-        category: 'Experience Highlight',
-        title: 'Launch a 30-Minute "Express Artisan Touch" Session',
-        advice: `Travelers on tight schedules often hesitate at 90-minute commitments. Introduce a quick ₹250 fitting where travelers shape a miniature lacquer ring or taste 3 teas with the master maker.`,
-        expectedImpact: '+35% conversion from tourists with tight day itineraries.'
-      },
-      {
-        category: 'Listing Optimization',
-        title: 'Emphasize Multi-Generational Heritage Story',
-        advice: `Highlight your 4th-generation roots directly in the first line. International and domestic cultural travelers value authentic master lineage over commercial retail shops.`,
-        expectedImpact: 'Higher trust and +40% save rate on TourismFlow itineraries.'
-      },
-      {
-        category: 'Interest Alignment',
-        title: 'Bundle with Nearby Cultural Walking Routes',
-        advice: `Partner with local Old City walking guides to position your workshop as the official rest & artisan demonstration stop following Charminar visits.`,
-        expectedImpact: 'Predictable morning footfall between 10:30 AM and 01:00 PM.'
-      },
-      {
-        category: 'Package Offer',
-        title: 'Create a "Family Keepsake Box" Combo',
-        advice: `Offer a bundled tier (e.g. 2 adult bangle fittings + 1 souvenir child craft box for ₹850). Family groups make up 48% of demo trip queries.`,
-        expectedImpact: 'Increases average transaction value by ~₹300.'
-      }
-    ],
-    isDemoFallback: true
-  });
 });
 
 // Endpoint: Tourism Impact Engine Explanation

@@ -195,7 +195,8 @@ export const BusinessHub: React.FC = () => {
         })
       });
 
-      if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
         const data = await res.json();
         if (data.suggestions && Array.isArray(data.suggestions) && data.suggestions.length >= 3) {
           setRecommendations(data.suggestions.slice(0, 3).map((s: any) => ({
